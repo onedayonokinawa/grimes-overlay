@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# emfix: dry-run an emerge and print the config fixes Portage asks for
+# as ready-to-paste commands. Nothing is changed on the system.
+# Usage: emfix <same arguments you gave emerge>   e.g.  emfix -uDN @world
+set -uo pipefail
+
+if [[ $# -eq 0 ]]; then
+    echo "Usage: emfix <emerge arguments>   e.g. emfix media-libs/libsfml"
+    exit 1
+fi
+
+out=$(emerge -p --autounmask=y --autounmask-continue=n "$@" 2>&1)
+
+fixes=$(awk '
+    /USE changes are necessary/         { dir = "package.use"; next }
+    /keyword changes are necessary/     { dir = "package.accept_keywords"; next }
+    /unmask changes are necessary/      { dir = "package.unmask"; next }
+    /mask changes are necessary/        { dir = "package.unmask"; next }
+    /license changes are necessary/     { dir = "package.license"; next }
+    dir == ""                           { next }
+    /^ *\(see / || /^#/                 { next }
+    /^[[:space:]]*$/                    { if (seen) { dir = ""; seen = 0 }; next }
+    /^[<>=~]*[a-z0-9-]+\/[^ ]+/ {
+        seen = 1
+        atom = $1
+        name = atom
+        sub(/^[<>=~]+/, "", name); sub(/:.*/, "", name)
+        sub(/-[0-9][^\/]*$/, "", name); sub(/.*\//, "", name)
+        printf "echo \"%s\" | sudo tee -a /etc/portage/%s/%s\n", $0, dir, name
+        found = 1
+    }
+    END { exit found ? 0 : 1 }
+' <<< "$out")
+status=$?
+
+if [[ $status -eq 0 ]]; then
+    echo "Portage needs these config changes. Paste them, then run your emerge again:"
+    echo
+    echo "$fixes"
+else
+    echo "No USE/keyword/mask/license fix found."
+    if grep -q -E 'conflict|blocked|cannot be installed at the same time' <<< "$out"; then
+        echo "It's a dependency conflict or blocker - paste the full output to Claude."
+    else
+        echo "If the emerge failed while compiling, the error is in the build log Portage named, e.g.:"
+        echo "  sudo tail -50 /var/tmp/portage/<category>/<package>/temp/build.log"
+    fi
+fi
