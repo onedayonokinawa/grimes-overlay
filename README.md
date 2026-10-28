@@ -22,7 +22,11 @@ emfix -uDN @world
 ```
 
 It does a dry run and prints any USE / keyword / unmask / license changes
-Portage needs as ready-to-paste commands. It never changes anything itself.
+Portage needs as ready-to-paste commands. When a package needs a USE flag
+choice Portage won't make for you (REQUIRED_USE, e.g. "exactly one of elogind
+or systemd"), it lists one line per choice so you can pick. If the package
+name is wrong, it shows emerge's "Maybe you meant" suggestions. It never
+changes anything itself.
 
 ```
 sudo emerge -av app-portage/emfix

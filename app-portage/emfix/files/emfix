@@ -9,7 +9,17 @@ if [[ $# -eq 0 ]]; then
     exit 1
 fi
 
-out=$(emerge -p --autounmask=y --autounmask-continue=n "$@" 2>&1)
+# Drop --ask/-a: this is only a dry run, there's nothing to say yes to
+args=()
+for a in "$@"; do
+    case $a in
+        --ask|--ask=*) ;;
+        -[!-]*) a=${a//a/}; [[ $a != - ]] && args+=("$a") ;;
+        *) args+=("$a") ;;
+    esac
+done
+
+out=$(emerge -p --autounmask=y --autounmask-continue=n "${args[@]}" 2>&1)
 
 fixes=$(awk '
     /USE changes are necessary/         { dir = "package.use"; next }
@@ -27,22 +37,94 @@ fixes=$(awk '
         sub(/^[<>=~]+/, "", name); sub(/:.*/, "", name)
         sub(/-[0-9][^\/]*$/, "", name); sub(/.*\//, "", name)
         printf "echo \"%s\" | sudo tee -a /etc/portage/%s/%s\n", $0, dir, name
-        found = 1
     }
-    END { exit found ? 0 : 1 }
 ' <<< "$out")
-status=$?
 
-if [[ $status -eq 0 ]]; then
+# REQUIRED_USE: Portage won't choose flags for you here, so offer each choice
+required=$(awk '
+    function line(flags) {
+        printf "  echo \"%s %s\" | sudo tee -a /etc/portage/package.use/%s\n", pkg, flags, name
+    }
+    function neg(f) { return f ~ /^!/ ? substr(f, 2) : "-" f }
+    function pos(f) { return f ~ /^!/ ? "-" substr(f, 2) : f }
+    /^- [a-z0-9-]+\/[^ ]+::/ {
+        pkg = $2; sub(/::.*/, "", pkg); sub(/-[0-9][^\/]*$/, "", pkg)
+        name = pkg; sub(/.*\//, "", name)
+        delete on
+        if (match($0, /USE="[^"]*"/)) {
+            n = split(substr($0, RSTART + 5, RLENGTH - 6), u, " ")
+            for (i = 1; i <= n; i++) {
+                f = u[i]; gsub(/[()*%]/, "", f)
+                if (f !~ /^-/) on[f] = 1
+            }
+        }
+        next
+    }
+    /REQUIRED_USE flag constraints are unsatisfied/ { inreq = 1; next }
+    inreq && /^[[:space:]]*$/ { inreq = 0; next }
+    !inreq { next }
+    {
+        c = $0; sub(/^[[:space:]]+/, "", c)
+        printf "%s needs: %s\n", pkg, c
+        k = split(c, t, " ")
+        if (k > 3 && t[1] ~ /^(exactly-one-of|any-of|at-most-one-of)$/ && t[2] == "(" && t[k] == ")" && c !~ /\?/) {
+            cnt = 0
+            for (i = 3; i < k; i++) if (on[t[i]]) cnt++
+            if (cnt == 0 && t[1] != "at-most-one-of") {
+                # none set: enable one of them
+                for (i = 3; i < k; i++) line(pos(t[i]))
+            } else {
+                # too many set: keep one, turn the others off
+                for (i = 3; i < k; i++) {
+                    if (!on[t[i]]) continue
+                    s = ""
+                    for (j = 3; j < k; j++) if (j != i && on[t[j]]) s = s " " neg(t[j])
+                    line(substr(s, 2))
+                }
+            }
+        } else if (k == 4 && t[1] ~ /\?$/ && t[2] == "(" && t[4] == ")") {
+            # "a? ( b )": turn b on, or turn a off
+            a = t[1]; sub(/\?$/, "", a)
+            line(pos(t[3])); line(neg(a))
+        } else if (k == 1 && t[1] ~ /^!?[a-zA-Z0-9_+-]+$/) {
+            line(pos(t[1]))
+        } else {
+            print "  (too complex to turn into a line: set the flags in /etc/portage/package.use/" name " yourself)"
+        }
+        print ""
+    }
+' <<< "$out")
+
+if [[ -n $fixes ]]; then
     echo "Portage needs these config changes. Paste them, then run your emerge again:"
     echo
     echo "$fixes"
-else
-    echo "No USE/keyword/mask/license fix found."
-    if grep -q -E 'conflict|blocked|cannot be installed at the same time' <<< "$out"; then
-        echo "It's a dependency conflict or blocker - paste the full output to Claude."
-    else
-        echo "If the emerge failed while compiling, the error is in the build log Portage named, e.g.:"
-        echo "  sudo tail -50 /var/tmp/portage/<category>/<package>/temp/build.log"
-    fi
 fi
+
+if [[ -n $required ]]; then
+    [[ -n $fixes ]] && echo
+    echo "These packages need USE flags that Portage won't choose for you."
+    echo "Pick ONE line for each package, paste it, then run your emerge again:"
+    echo
+    echo "$required"
+    echo
+    echo "If the same flag keeps coming up (like elogind on OpenRC), add it to USE= in"
+    echo "/etc/portage/make.conf instead, then run: sudo emerge -avuDN @world"
+fi
+
+[[ -n $fixes || -n $required ]] && exit 0
+
+if grep -q 'there are no ebuilds' <<< "$out"; then
+    echo "Package not found. emerge says:"
+    grep -E '^emerge: (there are no ebuilds|Maybe you meant)' <<< "$out" | sed 's/^emerge: /  /'
+    exit 1
+fi
+
+echo "No USE/keyword/mask/license fix found."
+if grep -q -E 'conflict|blocked|cannot be installed at the same time' <<< "$out"; then
+    echo "It's a dependency conflict or blocker - paste the full output to Claude."
+else
+    echo "If the emerge failed while compiling, the error is in the build log Portage named, e.g.:"
+    echo "  sudo tail -50 /var/tmp/portage/<category>/<package>/temp/build.log"
+fi
+exit 1
