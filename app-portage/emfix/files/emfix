@@ -4,6 +4,38 @@
 # Usage: emfix <same arguments you gave emerge>   e.g.  emfix -uDN @world
 set -uo pipefail
 
+EMFIX_VERSION=1.2
+SOURCE_URL=https://raw.githubusercontent.com/onedayonokinawa/grimes-overlay/main/app-portage/emfix/files/emfix
+
+echo "emfix $EMFIX_VERSION - work in progress tool, it can get things wrong. Check what it suggests before pasting."
+echo
+
+# Look up the newest emfix version at most once a day, in the background
+# while emerge runs. Offline or no wget/curl just means no update notice.
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/emfix/latest-version
+fetch=
+if [[ ! -f $cache || -n $(find "$cache" -mmin +1440 2>/dev/null) ]]; then
+    (
+        mkdir -p "${cache%/*}" 2>/dev/null || exit
+        src=$(wget -qO- -T 3 -t 1 "$SOURCE_URL" 2>/dev/null || curl -fsS --max-time 3 "$SOURCE_URL" 2>/dev/null)
+        v=$(sed -n 's/^EMFIX_VERSION=\([0-9.]*\)$/\1/p' <<< "$src")
+        [[ -n $v ]] && echo "$v" > "$cache.tmp" && mv "$cache.tmp" "$cache"
+    ) &
+    fetch=$!
+fi
+
+update_notice() {
+    [[ -n $fetch ]] && wait "$fetch" 2>/dev/null
+    local latest
+    latest=$(cat "$cache" 2>/dev/null) || return
+    [[ $latest =~ ^[0-9.]+$ && $latest != "$EMFIX_VERSION" ]] || return
+    [[ $(printf '%s\n' "$EMFIX_VERSION" "$latest" | sort -V | tail -1) == "$latest" ]] || return
+    echo
+    echo "*** A newer emfix is out (you have $EMFIX_VERSION, newest is $latest). Update it with:"
+    echo "***   sudo emaint sync -r grimes-overlay && sudo emerge -av app-portage/emfix"
+}
+trap update_notice EXIT
+
 if [[ $# -eq 0 ]]; then
     echo "Usage: emfix <emerge arguments>   e.g. emfix media-libs/libsfml"
     exit 1
@@ -19,7 +51,9 @@ for a in "$@"; do
     esac
 done
 
-out=$(emerge -p --autounmask=y --autounmask-continue=n "${args[@]}" 2>&1)
+# --ask=n and --color=n override EMERGE_DEFAULT_OPTS so the output can be read
+out=$(emerge -p --ask=n --color=n --autounmask=y --autounmask-continue=n "${args[@]}" 2>&1)
+rc=$?
 
 fixes=$(awk '
     /USE changes are necessary/         { dir = "package.use"; next }
@@ -120,11 +154,41 @@ if grep -q 'there are no ebuilds' <<< "$out"; then
     exit 1
 fi
 
-echo "No USE/keyword/mask/license fix found."
-if grep -q -E 'conflict|blocked|cannot be installed at the same time' <<< "$out"; then
-    echo "It's a dependency conflict or blocker - paste the full output to Claude."
-else
-    echo "If the emerge failed while compiling, the error is in the build log Portage named, e.g.:"
+if [[ $rc -eq 0 ]]; then
+    echo "The dry run worked, so there's nothing in your config to fix."
+    echo "If the real emerge failed while compiling, the error is in the build log Portage named, e.g.:"
     echo "  sudo tail -50 /var/tmp/portage/<category>/<package>/temp/build.log"
+    exit 0
 fi
+
+# Blockers and slot conflicts: two packages (or two versions of one) that
+# can't be installed together. Config lines can't fix these, so show the part
+# of emerge's output that says who wants what. Portage wraps its blocker
+# message, so match the pieces rather than the whole sentence.
+conflict=$(awk '
+    /^\[blocks / { print; next }
+    /on the same system\.$|resulting in a slot conflict:$/ { grab = 1; next }
+    /^For more information/ { grab = 0 }
+    grab
+' <<< "$out" | cat -s)
+
+if [[ -n $conflict ]]; then
+    echo "This is a dependency conflict: two packages (or two versions of one) can't be"
+    echo "installed together. Config lines can't fix that. Here's what emerge says is"
+    echo "pulling in each side:"
+    echo
+    head -50 <<< "$conflict"
+    n=$(wc -l <<< "$conflict")
+    (( n > 50 )) && echo "  ... ($((n - 50)) more lines, run: emerge -pv $*)"
+    echo
+    echo "Usually updating everything first sorts it out:"
+    echo "  sudo emerge -avuDN @world"
+    echo "then run your emerge again. If it still fails, send the output above to Claude."
+    exit 1
+fi
+
+echo "No USE/keyword/mask/license fix found, and it isn't a conflict emfix recognises."
+echo "Here's the end of what emerge said:"
+echo
+grep -v '^[[:space:]]*$' <<< "$out" | tail -25 | sed 's/^/  /'
 exit 1

@@ -26,7 +26,19 @@ Portage needs as ready-to-paste commands. When a package needs a USE flag
 choice Portage won't make for you (REQUIRED_USE, e.g. "exactly one of elogind
 or systemd"), it lists one line per choice so you can pick. If the package
 name is wrong, it shows emerge's "Maybe you meant" suggestions. It never
-changes anything itself.
+changes anything itself. If the problem is a dependency conflict (blocked
+packages or a slot conflict), it says so and shows which packages are pulling
+in each side.
+
+emfix is a work in progress, so check what it suggests before pasting. Once a
+day it checks GitHub for a newer version and tells you if one is out. Update
+it with:
+
+```
+sudo emaint sync -r grimes-overlay && sudo emerge -av app-portage/emfix
+```
+
+Install:
 
 ```
 sudo emerge -av app-portage/emfix
